@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ${DEPLOY_NAME}-llmproxy-config
+  namespace: openclaw-ns
+data:
+  litellm-config.yaml: |
+    model_list:
+${LITELLM_MODEL_LIST}
+
+    litellm_settings:
+      drop_params: true
+      set_verbose: false
+
+    general_settings:
+      master_key: ${MASTER_KEY}

@@ -1,0 +1,11 @@
+{
+	"azureOpenAI": [
+		{
+			"name": "<name alias>",
+			"endpoint": "https://<your Azure OpenAI resource name>.openai.azure.com/",
+			"key": "<your key here>"
+		}
+	],
+	"deploymentName": "gpt-5.2",
+	"apiVersion": "2025-04-01-preview"
+}

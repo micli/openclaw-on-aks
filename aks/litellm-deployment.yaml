@@ -1,0 +1,72 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${DEPLOY_NAME}-llmproxy
+  namespace: openclaw-ns
+  labels:
+    app: ${DEPLOY_NAME}-llmproxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ${DEPLOY_NAME}-llmproxy
+  template:
+    metadata:
+      labels:
+        app: ${DEPLOY_NAME}-llmproxy
+    spec:
+      containers:
+        - name: litellm
+          image: ghcr.io/berriai/litellm:main-latest
+          ports:
+            - containerPort: 4000
+          env:
+            - name: LITELLM_MASTER_KEY
+              value: "${MASTER_KEY}"
+            - name: LITELLM_LOG
+              value: "DEBUG"
+          args: ["--config", "/app/config/litellm-config.yaml", "--port", "4000", "--host", "0.0.0.0"]
+          volumeMounts:
+            - name: config-volume
+              mountPath: /app/config/litellm-config.yaml
+              subPath: litellm-config.yaml
+              readOnly: true
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "1Gi"
+              cpu: "1000m"
+          readinessProbe:
+            httpGet:
+              path: /health/readiness
+              port: 4000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health/liveliness
+              port: 4000
+            initialDelaySeconds: 60
+            periodSeconds: 20
+            timeoutSeconds: 5
+      volumes:
+        - name: config-volume
+          configMap:
+            name: ${DEPLOY_NAME}-llmproxy-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${DEPLOY_NAME}-llmproxy-svc
+  namespace: openclaw-ns
+spec:
+  type: LoadBalancer
+  selector:
+    app: ${DEPLOY_NAME}-llmproxy
+  ports:
+    - protocol: TCP
+      port: 4000
+      targetPort: 4000

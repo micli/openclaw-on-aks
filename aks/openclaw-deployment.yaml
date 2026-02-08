@@ -1,0 +1,87 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${DEPLOY_NAME}
+  namespace: openclaw-ns
+  labels:
+    app: ${DEPLOY_NAME}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ${DEPLOY_NAME}
+  template:
+    metadata:
+      labels:
+        app: ${DEPLOY_NAME}
+    spec:
+      containers:
+        - name: openclaw
+          image: alpine/openclaw:latest
+          ports:
+            - containerPort: 18789
+          env:
+            - name: OPENCLAW_GATEWAY_PORT
+              value: "18789"
+            - name: OPENCLAW_CONFIG_PATH
+              value: "/etc/openclaw/openclaw.json"
+            - name: OPENCLAW_STATE_DIR
+              value: "/home/node/.openclaw"
+            - name: OPENCLAW_GATEWAY_CONTROLUI_ALLOWINSECUREAUTH
+              value: "true"
+            - name: OPENCLAW_GATEWAY_CONTROL_UI_ALLOW_INSECURE_AUTH
+              value: "true"
+            - name: NODE_OPTIONS
+              value: "--max-old-space-size=4096"
+          volumeMounts:
+            - name: config-volume
+              mountPath: /etc/openclaw/openclaw.json
+              subPath: openclaw-config.json
+              readOnly: true
+            - name: openclaw-data
+              mountPath: /home/node/.openclaw
+            - name: openclaw-agents
+              mountPath: /home/node/.openclaw/agents
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "2Gi"
+              cpu: "1000m"
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 18789
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 18789
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 5
+      volumes:
+        - name: config-volume
+          configMap:
+            name: ${DEPLOY_NAME}-openclaw-config
+        - name: openclaw-data
+          emptyDir: {}
+        - name: openclaw-agents
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${DEPLOY_NAME}-svc
+  namespace: openclaw-ns
+spec:
+  type: LoadBalancer
+  selector:
+    app: ${DEPLOY_NAME}
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 18789

@@ -1,0 +1,45 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ${DEPLOY_NAME}-openclaw-config
+  namespace: openclaw-ns
+data:
+  openclaw-config.json: |
+    {
+      "gateway": {
+        "mode": "local",
+        "port": 18789,
+        "token": "${OPENCLAW_TOKEN}"
+      },
+      "agents": {
+        "default": {
+          "model": {
+            "primary": "litellm/${MODELNAME}"
+          },
+          "models": {
+            "litellm/${MODELNAME}": {
+              "alias": "Azure OpenAI ${MODELNAME}"
+            }
+          }
+        }
+      },
+      "models": {
+        "mode": "merge",
+        "providers": {
+          "litellm": {
+            "baseUrl": "http://${DEPLOY_NAME}-llmproxy-svc.openclaw-ns.svc.cluster.local:4000",
+            "apiKey": "${MASTER_KEY}",
+            "models": [
+              {
+                "id": "${MODELNAME}",
+                "name": "Azure OpenAI ${MODELNAME}",
+                "reasoning": false,
+                "input": ["text", "image"],
+                "contextWindow": 128000,
+                "maxTokens": 16384
+              }
+            ]
+          }
+        }
+      }
+    }
