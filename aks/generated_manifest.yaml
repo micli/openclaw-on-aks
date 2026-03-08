@@ -1,0 +1,373 @@
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: openclaw-ns
+
+---
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: openclaw-secrets
+  namespace: openclaw-ns
+type: Opaque
+data:
+  master_key: YTIxMmM3YWZhNzEyNDkyYjhjYzNlYTQwNzQwZTY4MzI=
+  openclaw_token: Yjg4YzZlZDYwZjExNDQ3OTk1ODQxYWMzNWI5ZDcxYmY=
+
+---
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openclaw-llmproxy-config
+  namespace: openclaw-ns
+data:
+  litellm-config.yaml: |
+    general_settings:
+      master_key: a212c7afa712492b8cc3ea40740e6832
+    litellm_settings:
+      drop_params: true
+      set_verbose: false
+    model_list:
+    - litellm_params:
+        api_base: https://micl-eastus2.openai.azure.com
+        api_version: 2025-04-01-preview
+        model: azure/gpt-5.2
+      model_name: gpt-5.2
+    - litellm_params:
+        api_base: https://micl-eastus2-2.openai.azure.com
+        api_version: 2025-04-01-preview
+        model: azure/gpt-5.2
+      model_name: gpt-5.2
+  run_proxy.py: |
+    
+    import os
+    import sys
+    import yaml
+    import uvicorn
+    import litellm
+    # Try importing Router early to ensure availability
+    from litellm.router import Router
+    from litellm.proxy.proxy_server import app, proxy_config
+    # Import standard Azure identity components
+    from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+    
+    def main():
+        print("[Wrapper] Starting LiteLLM Proxy Wrapper with Managed Identity Support")
+    
+        # 1. Setup Azure Auth Provider
+        print("[Wrapper] Initializing Azure Auth Provider...")
+        try:
+            # DefaultAzureCredential handles Managed Identity automatically when available
+            credential = DefaultAzureCredential()
+            # Scope is standard for Azure OpenAI
+            token_provider = get_bearer_token_provider(
+                credential, "https://cognitiveservices.azure.com/.default"
+            )
+            print("[Wrapper] Azure Auth Provider initialized successfully.")
+        except Exception as e:
+            print(f"[Wrapper] CRITICAL ERROR creating toke provider: {e}")
+            # We continue, but Azure calls will likely fail if key is missing
+            token_provider = None
+    
+        # 2. Load Config from standard path
+        config_path = "/app/config/litellm-config.yaml"
+        if not os.path.exists(config_path):
+            print(f"[Wrapper] Config file not found at {config_path}")
+            sys.exit(1)
+    
+        with open(config_path, 'r') as f:
+            config_data = yaml.safe_load(f)
+        
+        print(f"[Wrapper] Loaded configuration from {config_path}")
+    
+        # 3. Inject Token Provider into Model List
+        print("[Wrapper] Injecting Azure Token Provider into model configuration...")
+        final_model_list = []
+        managed_identity_count = 0
+        
+        raw_model_list = config_data.get("model_list", [])
+        for model in raw_model_list:
+            litellm_params = model.get("litellm_params", {})
+            model_name = litellm_params.get("model", "unknown")
+            
+            # Check if this is an Azure model
+            if "azure" in model_name:
+                if token_provider:
+                    litellm_params["azure_ad_token_provider"] = token_provider
+                    managed_identity_count += 1
+                
+                # Remove api_key if present to force usage of token provider or MI
+                if "api_key" in litellm_params:
+                    del litellm_params["api_key"]
+                    
+            final_model_list.append(model)
+        
+        print(f"[Wrapper] Processed {len(final_model_list)} models. {managed_identity_count} using Managed Identity.")
+    
+        # 4. Update Global State
+        # Set the global model_list for litellm
+        litellm.model_list = final_model_list
+        
+        # Check Master Key
+        if "general_settings" in config_data and "master_key" in config_data["general_settings"]:
+            os.environ["LITELLM_MASTER_KEY"] = config_data["general_settings"]["master_key"]
+            print("[Wrapper] LITELLM_MASTER_KEY set from config.")
+        
+        # 5. Re-initialize Router (CRITICAL FIX)
+        # The proxy server app relies on the global 'llm_router' object.
+        # By default, it loads from config file paths. We must overwrite it with our 
+        # Python-object-injected router (containing the token_provider callable).
+        print("[Wrapper] Re-constructing Global Router...")
+        try:
+            new_router = Router(model_list=final_model_list)
+            
+            # We need to update the router instance in the imported proxy_server module
+            import litellm.proxy.proxy_server as proxy_server_module
+            
+            if hasattr(proxy_server_module, 'llm_router'):
+                print("[Wrapper] Overwriting proxy_server.llm_router with authenticated router instance.")
+                proxy_server_module.llm_router = new_router
+            else:
+                print("[Wrapper] WARNING: proxy_server.llm_router not found. This version of LiteLLM might differ.")
+    
+            # Update proxy_config if it exists (used for some settings)
+            if hasattr(proxy_server_module, 'proxy_config') and proxy_server_module.proxy_config:
+                print("[Wrapper] Updating proxy_config model list.")
+                proxy_server_module.proxy_config.model_list = final_model_list
+                
+                # Apply general settings
+                settings = config_data.get("litellm_settings", {})
+                if settings:
+                    proxy_server_module.proxy_config.general_settings = settings
+        except Exception as e:
+            print(f"[Wrapper] Error during Router reconstruction: {e}")
+            # Fallback: hope global litellm.model_list is enough
+            
+        # Check Master Key
+        # Already handled above before router init for env var, but ensuring config consistency
+        
+        # 6. Start Server
+        print("[Wrapper] Starting Uvicorn Server on port 4000...")
+        # remove LITELLM_CONFIG_PATH env var to prevent double-loading interference
+        if "LITELLM_CONFIG_PATH" in os.environ:
+            del os.environ["LITELLM_CONFIG_PATH"]
+            
+        uvicorn.run(app, host="0.0.0.0", port=4000)
+    
+    if __name__ == "__main__":
+        main()
+
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openclaw-llmproxy
+  namespace: openclaw-ns
+  labels:
+    app: openclaw-llmproxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: openclaw-llmproxy
+  template:
+    metadata:
+      labels:
+        app: openclaw-llmproxy
+    spec:
+      containers:
+        - name: litellm
+          image: ghcr.io/berriai/litellm:main-latest
+          ports:
+            - containerPort: 4000
+          env:
+            - name: LITELLM_MASTER_KEY
+              value: "a212c7afa712492b8cc3ea40740e6832"
+            - name: AZURE_CLIENT_ID
+              value: "e87f7c31-4daf-4db0-8a28-c3550ba05df0"
+            - name: LITELLM_LOG
+              value: "DEBUG"
+            # Ensure python output is unbuffered
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          # Override entrypoint to run our wrapper script
+          command: ["python3"]
+          args: ["/app/config/run_proxy.py"]
+          volumeMounts:
+            - name: config-volume
+              mountPath: /app/config
+              readOnly: true
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "1Gi"
+              cpu: "1000m"
+          readinessProbe:
+            httpGet:
+              path: /health/readiness
+              port: 4000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health/liveliness
+              port: 4000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+      volumes:
+        - name: config-volume
+          configMap:
+            name: openclaw-llmproxy-config
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: openclaw-llmproxy-svc
+  namespace: openclaw-ns
+spec:
+  selector:
+    app: openclaw-llmproxy
+  ports:
+    - protocol: TCP
+      port: 4000
+      targetPort: 4000
+  type: LoadBalancer
+
+---
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openclaw-openclaw-config
+  namespace: openclaw-ns
+data:
+  openclaw-config.json: |
+    {
+        "gateway": {
+            "mode": "remote",
+            "port": 18789,
+            "auth": {
+                "token": "b88c6ed60f11447995841ac35b9d71bf"
+            }
+        },
+        "models": {
+            "mode": "merge",
+            "providers": {
+                "litellm": {
+                    "api": "openai-completions",
+                    "baseUrl": "http://openclaw-llmproxy-svc.openclaw-ns.svc.cluster.local:4000",
+                    "apiKey": "a212c7afa712492b8cc3ea40740e6832",
+                    "models": [
+                        {
+                            "id": "gpt-5.2",
+                            "name": "Azure OpenAI gpt-5.2",
+                            "reasoning": false,
+                            "input": [
+                                "text",
+                                "image"
+                            ],
+                            "contextWindow": 128000,
+                            "maxTokens": 16384
+                        }
+                    ]
+                }
+            }
+        }
+    }
+
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openclaw
+  namespace: openclaw-ns
+  labels:
+    app: openclaw
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: openclaw
+  template:
+    metadata:
+      labels:
+        app: openclaw
+    spec:
+      initContainers:
+        - name: init-agent-config
+          image: busybox
+          command: ["/bin/sh", "-c"]
+          args:
+            - "mkdir -p /home/node/.openclaw/agents/main/agent && echo '{\"providers\": {\"litellm\": {\"api\": \"openai-completions\", \"baseUrl\": \"http://openclaw-llmproxy-svc.openclaw-ns.svc.cluster.local:4000\", \"apiKey\": \"a212c7afa712492b8cc3ea40740e6832\", \"models\": [{\"id\": \"gpt-5.2\", \"name\": \"Azure OpenAI gpt-5.2\", \"reasoning\": false, \"input\": [\"text\", \"image\"], \"contextWindow\": 128000, \"maxTokens\": 16384}]}}, \"primary\": \"litellm/gpt-5.2\"}' > /home/node/.openclaw/agents/main/agent/models.json && chmod -R 777 /home/node/.openclaw"
+          volumeMounts:
+            - name: openclaw-agents
+              mountPath: /home/node/.openclaw/agents
+      containers:
+        - name: sidecar
+          image: alpine/socat
+          args: ["TCP-LISTEN:18790,fork,bind=0.0.0.0", "TCP:127.0.0.1:18789"]
+          ports:
+            - containerPort: 18790
+        - name: openclaw
+          image: alpine/openclaw:latest
+          ports:
+            - containerPort: 18789
+          env:
+            - name: OPENCLAW_GATEWAY_PORT
+              value: "18789"
+            - name: OPENCLAW_CONFIG_PATH
+              value: "/etc/openclaw/openclaw.json"
+            - name: OPENCLAW_STATE_DIR
+              value: "/home/node/.openclaw"
+            - name: NODE_OPTIONS
+              value: "--max-old-space-size=4096"
+          volumeMounts:
+            - name: config-volume
+              mountPath: /etc/openclaw/openclaw.json
+              subPath: openclaw-config.json
+              readOnly: true
+            - name: openclaw-data
+              mountPath: /home/node/.openclaw
+            - name: openclaw-agents
+              mountPath: /home/node/.openclaw/agents
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "2Gi"
+      volumes:
+        - name: config-volume
+          configMap:
+            name: openclaw-openclaw-config
+        - name: openclaw-data
+          emptyDir: {}
+        - name: openclaw-agents
+          emptyDir: {}
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: openclaw-svc
+  namespace: openclaw-ns
+spec:
+  selector:
+    app: openclaw
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 18790
+  type: LoadBalancer

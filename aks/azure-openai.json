@@ -1,9 +1,17 @@
 {
+	"deployName": "openclaw",
+	"region": "eastus2",
 	"azureOpenAI": [
 		{
-			"name": "<name alias>",
-			"endpoint": "https://<your Azure OpenAI resource name>.openai.azure.com/",
-			"key": "<your key here>"
+			"name": "micl-eastus2",
+			"endpoint": "https://micl-eastus2.openai.azure.com/",
+			"resource_group": "OpenAI"
+		},
+		{
+			"name": "micl-eastus2-2",
+			"endpoint": "https://micl-eastus2-2.openai.azure.com/",
+			"resource_group": "OpenAI",
+			"subscription_id": "74bb92e5-60a7-48af-8b92-6f66e5f6afcd"
 		}
 	],
 	"deploymentName": "gpt-5.2",

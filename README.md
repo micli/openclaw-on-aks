@@ -1,21 +1,22 @@
-# OpenClaw on Azure AKS 部署指南
+# OpenClaw on AKS 部署指南 (v2.0)
 
 本指南将帮助你在 Azure Kubernetes Service (AKS) 上一键部署 OpenClaw，并配置其使用 LiteLLM 作为代理来连接 Azure OpenAI 服务。
 
 ## 📋 目录
 
 - [部署架构](#部署架构)
+- [架构特点](#架构特点)
 - [前置条件](#前置条件)
 - [1. 准备 Azure OpenAI 资源](#1-准备-azure-openai-资源)
 - [2. 配置项目](#2-配置项目)
 - [3. 执行部署](#3-执行部署)
 - [4. 访问 Control UI](#4-访问-control-ui)
 - [5. 验证与测试](#5-验证与测试)
+- [6. 成本估算](#6-成本估算)
 
 ---
 
 ## 部署架构
-
 
 ![architecture](imgs/openclaw-deployment-architecture.jpg)
 
@@ -54,26 +55,45 @@
 *   **AI 调用链路**:
     *   OpenClaw -> (集群内网) -> LiteLLM Proxy -> (公网 HTTPS) -> Azure OpenAI Service。
 
-这个架构实现了**配置即代码**（所有配置通过 ConfigMap 注入）和**零信任网络**（内部组件间通过 Token 认证，外部访问通过端口转发加密隧道）。
+---
 
+## 🌟 架构特点 (Architecture Highlights)
 
+本方案采用全自动化 Python 脚本 (`deploy_openclaw.py`) 进行部署，具有以下核心特点：
 
+1.  **零密钥管理 (Managed Identity)**:
+    *   **安全增强**: 完全摒弃了在配置文件或环境变量中存储 Azure OpenAI API Key 的做法。
+    *   **身份认证**: 利用 Azure **User Assigned Managed Identity** (用户分配的托管标识) 自动获取 Entra ID Token。
+    *   **RBAC 控制**: 脚本自动为托管标识分配 `Cognitive Services OpenAI User` 角色，实现最小权限原则。
+
+2.  **动态代理层 (LiteLLM Proxy)**:
+    *   **统一接口**: LiteLLM Proxy 将 Azure OpenAI 的特定 API 转换为标准的 OpenAI 兼容接口，使 OpenClaw 可以直接使用。
+    *   **自定义注入**: 使用自定义 Python 启动脚本 (`run_proxy.py`)，在运行时动态注入 Azure Token Provider，确保 Token 自动刷新。
+    *   **智能路由**: 支持多区域/多资源的 Azure OpenAI 负载均衡（配置在 `azure-openai.json` 中）。
+
+3.  **Kubernetes 原生集成**:
+    *   **Secret 管理**: 自动生成并存储 `Master Key` 和 `OpenClaw Token` 到 K8s Secret 中。后续部署自动复用，无需本地文件。
+    *   **配置注入**: 所有配置通过 ConfigMap 挂载，支持热更新（需重启 Pod）。
+    *   **服务发现**: OpenClaw 通过 K8s 内部 DNS (`http://openclaw-llmproxy-svc...`) 直接访问代理层，流量不经过公网。
+
+---
 
 ## 前置条件
 
 在开始之前，请确保你的本地环境已安装以下工具：
 
 1.  **Azure CLI** (`az`)  
-    [安装指南](https://learn.microsoft.com/zh-cn/cli/azure/install-azure-cli) - 用于管理 Azure 资源。
+    *   [安装指南](https://learn.microsoft.com/zh-cn/cli/azure/install-azure-cli) - 用于管理 Azure 资源。
     *   安装后请运行 `az login` 登录。
 
 2.  **Kubernetes CLI** (`kubectl`)  
-    [安装指南](https://kubernetes.io/docs/tasks/tools/) - 用于管理 Kubernetes 集群。
+    *   [安装指南](https://kubernetes.io/docs/tasks/tools/) - 用于管理 Kubernetes 集群。
 
-3.  **Bash 环境** (macOS/Linux) 或 **PowerShell** (Windows)
-
-4.  **jq**
-    [安装指南](https://jqlang.github.io/jq/download/) - 用于处理 JSON 数据。macOS 用户可使用 `brew install jq` 安装。
+3.  **Python 3.8+**
+    *   安装依赖:
+        ```bash
+        pip install azure-identity azure-mgmt-resource azure-mgmt-containerservice azure-mgmt-compute azure-mgmt-msi azure-mgmt-authorization azure-mgmt-cognitiveservices kubernetes
+        ```
 
 ---
 
@@ -91,87 +111,93 @@ OpenClaw 需要大语言模型支持。我们需要先在 Azure 上创建一个 
 
 ## 2. 配置项目
 
-1.  进入项目目录：
+1.  进入 `aks` 目录：
     ```bash
     cd aks
     ```
 
-2.  编辑 `azure-openai.json` 文件：
+2.  编辑或创建 `azure-openai.json` 文件：
     ```json
     {
+      "deployName": "openclaw",
+      "region": "eastus2",
+      "deploymentName": "gpt-5.2",         // 在 Azure OpenAI Studio 中创建的部署名称
       "apiVersion": "2024-02-15-preview",  // 你的 Azure OpenAI API 版本
-      "deploymentName": "gpt-5.2",         // 你在 Azure OpenAI Studio 中创建的部署名称
       "azureOpenAI": [
         {
-          "name": "eastus2",
-          "endpoint": "https://<your-resource-name>.openai.azure.com/",
-          "key": "<your-api-key>"
+          "name": "resource-name-1",
+          "endpoint": "https://resource-name-1.openai.azure.com/",
+          "resource_group": "MyResourceGroup"
+          // 注意：此处无需配置 "key"，脚本会自动使用 Managed Identity
+        },
+        {
+          "name": "resource-name-2",
+          "endpoint": "https://resource-name-2.openai.azure.com/",
+          "resource_group": "MyResourceGroup" 
+          // 可选: "subscription_id": "xxx" 如果资源在不同订阅下
         }
       ]
     }
     ```
     *   `endpoint`: 你的 Azure OpenAI 资源端点 URL。
-    *   `key`: 你的 Azure OpenAI API 密钥（Key 1 或 Key 2）。
+    *   `resource_group`: 资源所在的 Azure 资源组。
     *   LiteLLM 支持配置多个 Azure OpenAI 资源进行负载平衡。
 
 ---
 
 ## 3. 执行部署
 
-根据你的操作系统选择相应的脚本。
-
-### macOS / Linux (Bash)
+使用 Python 脚本执行一键部署。
 
 ```bash
-# 添加执行权限
-chmod +x deploy-openclaw-aks.sh
+# 确保在 aks 目录下
+cd aks
 
 # 运行部署脚本
-# 参数: ./deploy-openclaw-aks.sh <部署名称> <区域> <模型显示名称>
-./deploy-openclaw-aks.sh openclaw eastus2 gpt-5.2
-```
-
-### Windows (PowerShell)
-
-在 PowerShell 终端中运行：
-
-```powershell
-.\deploy-openclaw-aks.ps1 -DeployName "openclaw" -Region "eastus2" -ModelName "gpt-5.2"
+python3 deploy_openclaw.py --config azure-openai.json
 ```
 
 **脚本会自动执行以下操作：**
-1.  检查工具依赖。
-2.  生成随机的安全密钥 (Master Key 和 Gateway Token)。
-3.  创建资源组和 AKS 集群（如果是首次运行，耗时约 5-10 分钟）。
-4.  部署 LiteLLM（作为 Azure OpenAI 的代理）。
-5.  部署 OpenClaw，并自动配置连接到 LiteLLM。
+1.  **基础设施**: 创建资源组、AKS 集群和用户分配的托管标识 (Managed Identity)。
+2.  **授权**: 为托管标识分配 Azure OpenAI 的 `Cognitive Services OpenAI User` 角色。
+3.  **配置**: 生成 K8s Secret (Master Key, OpenClaw Token) 和 ConfigMaps。
+4.  **部署**: 应用 K8s Manifests，启动 LiteLLM Proxy 和 OpenClaw 服务。
 
 ---
 
 ## 4. 访问 Control UI
 
-由于浏览器对非 HTTPS 网站的安全限制（禁止使用 WebCrypto API），直接通过 IP 访问 OpenClaw Control UI 会导致报错。我们需要通过 **端口转发** 将服务映射到本地。
+由于 OpenClaw Control UI 依赖 WebCrypto API（要求 HTTPS 或 localhost 环境），直接通过 Cluster IP 访问会导致功能不可用。我们需要通过 **端口转发** 将服务映射到本地。
 
-1.  **保持连接**：
-    在部署脚本执行完毕后，它会提示你运行一条命令。请复制并在终端中运行它（保持终端开启）：
+1.  **建立本地隧道**：
+    在部署脚本执行完毕后，请在终端中运行（保持终端开启）：
 
     ```bash
     kubectl port-forward service/openclaw-svc 18789:80 -n openclaw-ns
     ```
+    
+    > **注意**: 如果你在 `azure-openai.json` 中修改了 `deployName` (默认为 `openclaw`)，请将命令中的 `openclaw-svc` 替换为 `<你的部署名>-svc`。
+    > **提示**: 这会将 Kubernetes 集群中的服务端口 80 映射到你本地电脑的 18789 端口。
 
-2.  **打开浏览器**：
-    访问以下地址（脚本结束时会显示带有 Token 的完整链接）：
+2.  **获取 Token**：
+    你需要获取部署时生成的 Token。
+    ```bash
+    # 查看 Secret 内容
+    kubectl get secret openclaw-secrets -n openclaw-ns -o jsonpath='{.data.openclaw_token}' | base64 -d
+    ```
+    或者直接在 Kubernetes Dashboard 中查看 `openclaw-secrets`。
+
+3.  **打开浏览器**：
+    访问以下地址：
 
     **`http://127.0.0.1:18789/?token=<YOUR_TOKEN>`**
-
-    *   Token 可以在脚本输出中找到，或者查看生成的 `.secrets` 文件。
 
 ---
 
 ## 5. 验证与测试
 
 1.  **进入 Overview 界面**：
-    在 Control UI 左侧菜单点击 **Overview**。在 Access Token 中输入 Token 串。
+    在 Control UI 左侧菜单点击 **Overview**。如果在 Access Token 中输入了正确的 Token 串，应该显示“Gateway Connected”。
     ![OpenClaw Chat UI](imgs/openclaw-overview.png)
 
 2.  **进入 Chat 界面**：
@@ -184,16 +210,50 @@ chmod +x deploy-openclaw-aks.sh
     如果 OpenClaw 成功回复，说明连接链路（OpenClaw -> LiteLLM -> Azure OpenAI）工作正常。
     ![OpenClaw Chat UI](imgs/openclaw-chat.png)
 
-4.  **设置 Channel**：
+5.  **设置 Channel**：
     在 Control UI 左侧菜单点击 **Channel**。输入对应社交媒体 App 的 credential 和 url，确保 openclaw 连接社交媒体。
     ![Channel](imgs/openclaw-channel.png)
 
 ### 常见问题排查
 
 *   **报错 "device identity required"**：
-    *   原因：你可能使用了直接 IP 访问（http://130.x.x.x）。
+    *   原因：你可能使用了直接 IP 访问（http://20.x.x.x）。
     *   解决：请务必使用 `kubectl port-forward` 并通过 `http://127.0.0.1:18789` 访问。
 
 *   **Chat 页面无响应或报错**：
-    *   检查 LiteLLM 日志：`kubectl logs -l app=openclaw-llmproxy -n openclaw-ns`
-    *   确认 `azure-openai.json` 中的 API Key 和 Endpoint 是否正确。
+    *   检查 LiteLLM 日志：`kubectl logs -l app=openclaw-llmproxy -n openclaw-ns -f`
+    *   确认 Managed Identity 是否有对应 OpenAI 资源的权限（Role Assignments）。
+
+---
+
+## 6. 成本估算 (Cost Estimation)
+
+以下成本基于 **East US 2** 区域，仅供参考 (按月计算，730小时)：
+
+| 资源类型 | 规格 | 数量 | 预估成本 (月) | 说明 |
+| :--- | :--- | :--- | :--- | :--- |
+| **AKS Cluster** | Standard Tier (Base) | 1 | 免费 | 管理平面若不开启 SLA 保证则免费 |
+| **VM Node** | **Standard_B2s** | 1 | ~$30.37 | 2 vCPU, 4GB RAM (适合测试/轻量级) |
+| **Managed Disk** | P10 (128GB) | 1 | ~$5.89 | 节点系统盘 |
+| **Public IP** | Standard | 1 | ~$3.65 | 用于 Load Balancer |
+| **Load Balancer** | Standard | 1 | ~$18.00 | 数据处理费另计 |
+| **总计** | | | **~$58 / 月** | 不包含 OpenAI 调用费用 |
+
+> **节省成本提示**: 
+> *   测试完成后，使用 `az group delete -n <DEPLOY_NAME>-RG` 删除整个资源组以停止计费。
+> *   生产环境建议使用至少 `Standard_D2s_v5` (~$70/月) 以获得更好性能。
+
+## 🛠️ 常见操作
+
+*   **重启服务**:
+    ```bash
+    kubectl rollout restart deployment openclaw -n openclaw-ns
+    ```
+*   **查看日志**:
+    ```bash
+    # OpenClaw 日志
+    kubectl logs -l app=openclaw -n openclaw-ns -f
+
+    # LiteLLM Proxy 日志 (查看 Auth 注入情况)
+    kubectl logs -l app=openclaw-llmproxy -n openclaw-ns -f
+    ```
