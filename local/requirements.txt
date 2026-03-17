@@ -1,0 +1,10 @@
+azure-identity
+azure-mgmt-resource
+azure-mgmt-containerservice
+azure-mgmt-compute
+azure-mgmt-msi
+azure-mgmt-authorization
+azure-mgmt-cognitiveservices
+kubernetes
+pyyaml
+azure-mgmt-subscription
